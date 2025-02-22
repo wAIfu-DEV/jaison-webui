@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JAIson WebUi</title>
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            background-color: #f0f0f0;
+        }
+
+        p {
+            font-size: 1.5rem;
+            margin-bottom: 1rem;
+        }
+
+        input {
+            padding: 0.5rem;
+            margin: 0.5rem;
+            font-size: 1rem;
+        }
+
+        #response {
+            width: 700px;
+            height: 200px;
+            text-align: center;
+            text-wrap-mode: wrap;
+            overflow-y: auto;
+            padding: 0.5rem;
+            border: 1px solid #ccc;
+            background-color: #fff;
+        }
+    </style>
+</head>
+
+<body>
+    <p id="response"></p>
+    <input type="text" id="input" placeholder="Enter your text here">
+    <span>
+        <input type="button" id="send" value="Send">
+        <input type="button" id="stop" value="Stop">
+    </span>
+
+    <script>
+        // Incoming audio processing worker
+        const workerCode = `
+      self.onmessage = function(e) {
+        const {data} = e.data;
+        const parsed = JSON.parse(data)[0];
+
+        const binaryString = atob(parsed.response.chunk);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+            bytes[i] = binaryString.charCodeAt(i);
+        }
+        self.postMessage({ int8Buffer: bytes.buffer }, [bytes.buffer]);
+      };
+    `;
+
+        // Create a Blob from the worker code
+        const blob = new Blob([workerCode], { type: "application/javascript" });
+        const workerURL = URL.createObjectURL(blob);
+        const decoderWorker = new Worker(workerURL);
+
+        /** @type{ PCMPlayer } */
+        let pcmPlayer = null;
+
+        decoderWorker.onmessage = (e) => {
+            pcmPlayer.play(e.data.int8Buffer);
+        };
+
+        class PCMPlayer {
+            constructor(sampleRate = 24000, channels = 1) {
+                this.audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                    sampleRate: sampleRate,
+                });
+                this.channels = channels;
+                this.queue = [];
+                this.isPlaying = false;
+                this.isBuffering = true;
+                this.nextPlayTime = 0;
+                this.receivedAll = false;
+            }
+
+            async play(arrayBuffer) {
+                // Create an AudioBuffer
+                const audioBuffer = this.audioContext.createBuffer(
+                    this.channels,
+                    arrayBuffer.byteLength / (2 * this.channels), // 16-bit = 2 bytes per sample
+                    this.audioContext.sampleRate
+                );
+
+                // Get the raw PCM data as Int16Array
+                const int16Array = new Int16Array(arrayBuffer);
+
+                // Fill each channel
+                for (let channel = 0; channel < this.channels; channel++) {
+                    const channelData = audioBuffer.getChannelData(channel);
+                    for (let i = 0; i < channelData.length; i++) {
+                        // Get sample for this channel and convert to float
+                        channelData[i] = int16Array[i * this.channels + channel] / 32768.0;
+                    }
+                }
+
+                // Queue this buffer
+                this.queue.push({
+                    buffer: audioBuffer,
+                    duration: audioBuffer.duration
+                });
+
+                if (this.isBuffering && this.queue.length > 7) {
+                    this.isBuffering = false;
+                } else {
+                    return;
+                }
+
+                // Start playing if not already
+                if (!this.isPlaying) {
+                    this.playNextChunk();
+                }
+            }
+
+            playNextChunk() {
+                if (this.receivedAll && this.queue.length === 0) {
+                    this.isPlaying = false;
+                    return;
+                } else if (this.queue.length === 0) {
+                    return;
+                }
+
+                this.isPlaying = true;
+                const chunk = this.queue.shift();
+
+                const source = this.audioContext.createBufferSource();
+                source.buffer = chunk.buffer;
+                source.connect(this.audioContext.destination);
+
+                if (this.nextPlayTime < this.audioContext.currentTime) {
+                    this.nextPlayTime = this.audioContext.currentTime;
+                }
+
+                source.start(this.nextPlayTime);
+                this.nextPlayTime += chunk.duration;
+
+                source.onended = () => {
+                    this.playNextChunk();
+                };
+            }
+
+            markReceivedAll() {
+                this.receivedAll = true;
+                this.isBuffering = false;
+            }
+
+            reset() {
+                this.queue = [];
+                this.isPlaying = false;
+                this.isBuffering = true;
+                this.nextPlayTime = 0;
+                this.receivedAll = false;
+            }
+        }
+
+        const WSURL = 'ws://127.0.0.1:5001';
+        const RECONNECT_TIME = 5000;
+
+        const input = document.getElementById('input');
+        const response = document.getElementById('response');
+        const sendBtn = document.getElementById('send');
+        const stopBtn = document.getElementById('stop');
+
+        let currentRunId = "";
+
+        sendBtn.addEventListener("click", (ev) => {
+            // Reset player for new utterance
+            if (pcmPlayer) {
+                pcmPlayer.reset();
+            }
+
+            fetch('http://127.0.0.1:5001/run', {
+                method: 'POST',
+                mode: 'no-cors',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    input_user: 'User',
+                    input_text: input.value,
+                    process_dialog: true
+                })
+            });
+
+            input.value = '';
+            response.textContent = '';
+        });
+
+        stopBtn.addEventListener("click", async (ev) => {
+            await fetch('http://127.0.0.1:5001/run', {
+                method: 'DELETE',
+                //mode: 'no-cors',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    run_id: currentRunId,
+                })
+            });
+
+            response.textContent = '';
+
+            // Clear audio buffers
+            if (pcmPlayer) {
+                pcmPlayer.reset();
+            }
+        });
+
+        let awaitNewFormat = false;
+
+        const HandleMessage = async (ev) => {
+            const data = ev.data;
+
+            // You may ask, why not use JSON.parse directly?
+            // There actually is a good reason,
+            // The answer is- *gets killed*
+            if (data.includes("run_tts_chunk")) {
+                if (awaitNewFormat) {
+                    awaitNewFormat = false;
+                    let parsed = JSON.parse(data)[0];
+                    pcmPlayer = new PCMPlayer(parsed.response.sample_rate, parsed.response.channels);
+                }
+                pcmPlayer.playNextChunk();
+                decoderWorker.postMessage({ data });
+            } else if (data.includes("run_tts_start")) {
+                awaitNewFormat = true;
+            } else if (data.includes("run_tts_stop")) {
+                pcmPlayer.markReceivedAll();
+                pcmPlayer.playNextChunk();
+            } else if (data.includes("run_t2t_chunk")) {
+                let parsed = JSON.parse(data)[0];
+                response.innerText += parsed.response.chunk;
+                response.scrollTo({ top: response.scrollHeight, behavior: 'smooth' });
+            } else if (data.includes("run_start")) {
+                let parsed = JSON.parse(data)[0];
+                currentRunId = parsed.response.run_id;
+            } else {
+                console.log(data);
+            }
+        };
+
+        const ConnectWebSocket = () => {
+            const ws = new WebSocket(WSURL);
+
+            ws.onerror = (err) => {
+                console.error('WebSocket error:', err);
+                setTimeout(ConnectWebSocket, RECONNECT_TIME);
+            };
+
+            ws.onopen = () => {
+                console.log('WebSocket connected');
+                ws.onmessage = (ev) => {
+                    HandleMessage(ev);
+                };
+
+                ws.onclose = (ev) => {
+                    console.log("WebSocket closed");
+                    setTimeout(ConnectWebSocket, RECONNECT_TIME);
+                };
+            };
+        };
+
+        ConnectWebSocket();
+    </script>
+</body>
+
+</html>
